@@ -30,7 +30,7 @@ pip install -r requirements.txt
 BOT_TOKEN=ваш_токен_бота
 ```
 
-**Токен уже настроен:** `7972958560:AAH81czyJC5JOHK1q6OD69DGSPV-fbg0Tmc`
+
 
 ### 4. Настройка бота в Telegram
 
