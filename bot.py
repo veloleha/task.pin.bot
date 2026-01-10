@@ -61,6 +61,15 @@ def init_db():
     except Exception as e:
         logger.warning(f"⚠️ Не удалось добавить колонку mode: {e}")
     
+    # Добавляем колонку topic_id для задач при необходимости
+    try:
+        c.execute("PRAGMA table_info(tasks)")
+        task_columns = [col[1] for col in c.fetchall()]
+        if 'topic_id' not in task_columns:
+            c.execute("ALTER TABLE tasks ADD COLUMN topic_id INTEGER")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось добавить колонку topic_id: {e}")
+    
     conn.commit()
     conn.close()
     logger.info("✅ База данных инициализирована")
@@ -87,6 +96,34 @@ def update_task_message_id(task_id, message_id):
     c.execute("UPDATE tasks SET message_id=? WHERE id=?", (message_id, task_id))
     conn.commit()
     conn.close()
+
+
+# --- ПОЛУЧИТЬ MESSAGE_ID ЗАДАЧИ ---
+def get_task_message_id(task_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT message_id FROM tasks WHERE id=?", (task_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+# --- ОБНОВЛЕНИЕ TOPIC_ID ЗАДАЧИ ---
+def update_task_topic_id(task_id, topic_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET topic_id=? WHERE id=?", (topic_id, task_id))
+    conn.commit()
+    conn.close()
+
+
+def get_task_topic_id(task_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT topic_id FROM tasks WHERE id=?", (task_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # --- ЗАКРЫТИЕ ЗАДАЧИ ---
@@ -186,6 +223,33 @@ def create_message_link(chat_id, message_id):
     else:
         chat_id_clean = str(chat_id).lstrip('-')
     return f"https://t.me/c/{chat_id_clean}/{message_id}"
+
+
+# --- СОЗДАНИЕ ТЕМЫ ДЛЯ ЗАДАЧИ И ПУБЛИКАЦИЯ СООБЩЕНИЯ ---
+async def create_task_topic_and_post(chat_id: int, task_id: int, source_message_id: int):
+    try:
+        topic_name = f"Задача #{task_id}"
+        topic = await bot.create_forum_topic(chat_id=chat_id, name=topic_name)
+        topic_id = getattr(topic, "message_thread_id", None)
+        if not topic_id:
+            logger.warning(f"⚠️ Не удалось получить message_thread_id для темы задачи #{task_id}")
+            return
+        update_task_topic_id(task_id, topic_id)
+
+        # Копируем исходное сообщение в тему (клавиатура копируется вместе)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
+        )
+        await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=chat_id,
+            message_id=source_message_id,
+            message_thread_id=topic_id,
+            reply_markup=kb
+        )
+        logger.info(f"🧵 Создана тема (thread_id={topic_id}) и опубликовано сообщение для задачи #{task_id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при создании темы для задачи #{task_id}: {e}")
 
 
 # --- ПРОВЕРКА ПРАВ БОТА ---
@@ -334,6 +398,18 @@ async def mode_manual_cmd(message: types.Message):
         pass
 
 
+# --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА: ТЕМЫ ---
+@dp.message(F.text == "/mode_topic")
+async def mode_topic_cmd(message: types.Message):
+    chat_id = message.chat.id
+    set_chat_mode(chat_id, 'topic')
+    await message.answer("🧵 Режим установлен: темы. Для каждой задачи создаётся отдельная тема с копией сообщения.")
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
 # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА: АВТО ---
 @dp.message(F.text == "/mode_auto")
 async def mode_auto_cmd(message: types.Message):
@@ -351,6 +427,9 @@ async def mode_auto_cmd(message: types.Message):
 async def handle_message(message: types.Message):
     # Игнорируем сообщения от ботов
     if message.from_user.is_bot:
+        return
+    # Игнорируем сообщения внутри тем (обсуждение задач)
+    if getattr(message, "message_thread_id", None):
         return
 
     chat_id = message.chat.id
@@ -374,6 +453,7 @@ async def handle_message(message: types.Message):
             inline_keyboard=[[InlineKeyboardButton(text="📝 Создать задачу", callback_data=f"create_{task_id}")]]
         )
 
+    source_message_id = None
     try:
         if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None) or getattr(message, "animation", None) or getattr(message, "voice", None) or getattr(message, "audio", None) or getattr(message, "sticker", None) or getattr(message, "video_note", None):
             copied = await bot.copy_message(
@@ -386,6 +466,7 @@ async def handle_message(message: types.Message):
             if new_message_id:
                 update_task_message_id(task_id, new_message_id)
                 logger.debug(f"✉️ Скопировано медиа-сообщение {new_message_id} с кнопкой для задачи #{task_id}")
+                source_message_id = new_message_id
             else:
                 logger.warning("⚠️ Не удалось получить message_id скопированного сообщения")
         else:
@@ -399,6 +480,7 @@ async def handle_message(message: types.Message):
             )
             update_task_message_id(task_id, sent_msg.message_id)
             logger.debug(f"✉️ Отправлено сообщение {sent_msg.message_id} с кнопкой для задачи #{task_id}")
+            source_message_id = sent_msg.message_id
     except Exception as e:
         logger.error(f"❌ Ошибка отправки сообщения для задачи #{task_id}: {e}")
     
@@ -408,6 +490,10 @@ async def handle_message(message: types.Message):
             await update_pinned_message(chat_id)
         except Exception as e:
             logger.warning(f"⚠️ Не удалось обновить закреп в авто-режиме: {e}")
+
+    # В режиме тем создаём тему сразу для авто-режима
+    if get_chat_mode(chat_id) == 'topic' and is_auto and source_message_id:
+        await create_task_topic_and_post(chat_id, task_id, source_message_id)
     
     # Удалить оригинальное сообщение (требуются права администратора)
     try:
@@ -439,6 +525,10 @@ async def create_task_callback(callback: types.CallbackQuery):
         # Обновляем закрепленное сообщение
         await update_pinned_message(callback.message.chat.id)
         
+        # В режиме тем создаём тему и публикуем сообщение
+        if get_chat_mode(callback.message.chat.id) == 'topic':
+            await create_task_topic_and_post(callback.message.chat.id, task_id, callback.message.message_id)
+        
     except Exception as e:
         logger.error(f"❌ Ошибка при создании задачи: {e}")
         await callback.answer("❌ Ошибка при создании задачи", show_alert=True)
@@ -449,22 +539,58 @@ async def create_task_callback(callback: types.CallbackQuery):
 async def close_task_callback(callback: types.CallbackQuery):
     try:
         task_id = int(callback.data.split("_")[1])
+        chat_id = callback.message.chat.id
+        in_topic = bool(getattr(callback.message, "message_thread_id", None))
+
+        # 1) Закрываем задачу в БД
         close_task(task_id)
-        
-        # Меняем кнопку на "Переоткрыть"
-        kb = InlineKeyboardMarkup(
+
+        # 2) Меняем кнопку на исходном сообщении в общем потоке
+        kb_reopen = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="♻️ Переоткрыть", callback_data=f"reopen_{task_id}")]]
         )
-        await callback.message.edit_reply_markup(reply_markup=kb)
-        await callback.answer("Задача закрыта ✅")
+        try:
+            orig_msg_id = get_task_message_id(task_id)
+            if orig_msg_id:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_reopen)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось обновить кнопки исходного сообщения задачи #{task_id}: {e}")
+
+        # 3) Если клик был НЕ в теме (в исходном сообщении) — обновим и текущую кнопку
+        if not in_topic:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb_reopen)
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось обновить кнопки текущего сообщения: {e}")
+
+        # 4) Удаляем тему (если есть)
+        topic_id = get_task_topic_id(task_id)
+        if topic_id:
+            try:
+                await bot.delete_forum_topic(chat_id, message_thread_id=topic_id)
+                update_task_topic_id(task_id, None)
+                logger.info(f"🧹 Удалена тема задачи #{task_id} (thread_id={topic_id})")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось удалить тему задачи #{task_id}: {e}")
+
+        # 5) Ответ пользователю и обновление закрепа (всегда, даже если часть шагов не удалась)
+        try:
+            await callback.answer("Задача закрыта ✅")
+        except:
+            pass
+        try:
+            await update_pinned_message(chat_id)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось обновить закреп: {e}")
+
         logger.info(f"🔒 Задача #{task_id} закрыта пользователем @{callback.from_user.username}")
-        
-        # Обновляем закрепленное сообщение
-        await update_pinned_message(callback.message.chat.id)
-        
+
     except Exception as e:
         logger.error(f"❌ Ошибка при закрытии задачи: {e}")
-        await callback.answer("❌ Ошибка при закрытии задачи", show_alert=True)
+        try:
+            await callback.answer("❌ Ошибка при закрытии задачи", show_alert=True)
+        except:
+            pass
 
 
 # --- ЗАГЛУШКА ДЛЯ ЗАКРЫТЫХ ЗАДАЧ ---
@@ -478,17 +604,50 @@ async def none_callback(callback: types.CallbackQuery):
 async def reopen_task_callback(callback: types.CallbackQuery):
     try:
         task_id = int(callback.data.split("_")[1])
+        chat_id = callback.message.chat.id
         set_task_status(task_id, 'open')
-        kb = InlineKeyboardMarkup(
+
+        # Кнопка "Закрыть" для исходного сообщения
+        kb_close = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
         )
-        await callback.message.edit_reply_markup(reply_markup=kb)
-        await callback.answer("Задача переоткрыта ✅")
+
+        # Обновляем кнопки на исходном сообщении
+        try:
+            orig_msg_id = get_task_message_id(task_id)
+            if orig_msg_id:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_close)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось обновить кнопки исходного сообщения при переоткрытии задачи #{task_id}: {e}")
+
+        # Ответ пользователю и обновление закрепа
+        try:
+            await callback.answer("Задача переоткрыта ✅")
+        except:
+            pass
+        try:
+            await update_pinned_message(chat_id)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось обновить закреп: {e}")
+
+        # В режиме тем создаём новую тему и публикуем копию сообщения
+        if get_chat_mode(chat_id) == 'topic':
+            # Используем исходное сообщение (в общем потоке) как источник
+            try:
+                source_msg_id = get_task_message_id(task_id)
+                if source_msg_id:
+                    await create_task_topic_and_post(chat_id, task_id, source_msg_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось создать тему при переоткрытии задачи #{task_id}: {e}")
+
         logger.info(f"🔓 Задача #{task_id} переоткрыта пользователем @{callback.from_user.username}")
-        await update_pinned_message(callback.message.chat.id)
+
     except Exception as e:
         logger.error(f"❌ Ошибка при переоткрытии задачи: {e}")
-        await callback.answer("❌ Ошибка при переоткрытии задачи", show_alert=True)
+        try:
+            await callback.answer("❌ Ошибка при переоткрытии задачи", show_alert=True)
+        except:
+            pass
 
 
 # --- ИНИЦИАЛИЗАЦИЯ ЗАКРЕПОВ ДЛЯ ВСЕХ ЧАТОВ ---
