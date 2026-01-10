@@ -8,7 +8,7 @@ import html
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Загрузка токена из .env
@@ -58,6 +58,8 @@ def init_db():
         columns = [col[1] for col in c.fetchall()]
         if 'mode' not in columns:
             c.execute("ALTER TABLE chats ADD COLUMN mode TEXT DEFAULT 'manual'")
+        if 'topic_enabled' not in columns:
+            c.execute("ALTER TABLE chats ADD COLUMN topic_enabled INTEGER DEFAULT 0")
     except Exception as e:
         logger.warning(f"⚠️ Не удалось добавить колонку mode: {e}")
     
@@ -215,6 +217,34 @@ def set_chat_mode(chat_id, mode):
         conn.close()
 
 
+# --- ТОГГЛ РЕЖИМА ТЕМ ---
+def get_topic_enabled(chat_id) -> bool:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT topic_enabled FROM chats WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        return bool(row[0]) if row else False
+    finally:
+        conn.close()
+
+
+def set_topic_enabled(chat_id, enabled: bool):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT chat_id FROM chats WHERE chat_id=?", (chat_id,))
+        exists = c.fetchone() is not None
+        val = 1 if enabled else 0
+        if exists:
+            c.execute("UPDATE chats SET topic_enabled=? WHERE chat_id=?", (val, chat_id))
+        else:
+            c.execute("INSERT INTO chats (chat_id, pin_message_id, mode, topic_enabled) VALUES (?, ?, ?, ?)", (chat_id, None, 'manual', val))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # --- СОЗДАНИЕ ССЫЛКИ НА СООБЩЕНИЕ ---
 def create_message_link(chat_id, message_id):
     # Для приватных/супергрупп chat_id имеет вид -100XXXXXXXXXX
@@ -251,6 +281,25 @@ async def create_task_topic_and_post(chat_id: int, task_id: int, source_message_
     except Exception as e:
         logger.error(f"❌ Ошибка при создании темы для задачи #{task_id}: {e}")
 
+
+# --- РЕГИСТРАЦИЯ КОМАНД БОТА ---
+async def setup_bot_commands():
+    commands = [
+        types.BotCommand(command="start", description="Запуск бота"),
+        types.BotCommand(command="refresh", description="Обновить закреп"),
+        types.BotCommand(command="mode_manual", description="Режим: вручную"),
+        types.BotCommand(command="mode_auto", description="Режим: авто"),
+        types.BotCommand(command="mode_topic", description="Режим: темы"),
+        types.BotCommand(command="topic_on", description="Включить режим тем"),
+        types.BotCommand(command="topic_off", description="Выключить режим тем"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+        await bot.set_my_commands(commands, scope=types.BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands(commands, scope=types.BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(commands, scope=types.BotCommandScopeAllChatAdministrators())
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось установить список команд бота: {e}")
 
 # --- ПРОВЕРКА ПРАВ БОТА ---
 async def check_bot_permissions(chat_id):
@@ -363,7 +412,7 @@ async def start_cmd(message: types.Message):
 
 
 # --- КОМАНДА /refresh ---
-@dp.message(F.text == "/refresh")
+@dp.message(Command("refresh"))
 async def refresh_cmd(message: types.Message):
     """Принудительное обновление закрепленного сообщения"""
     try:
@@ -387,7 +436,7 @@ async def refresh_cmd(message: types.Message):
 
 
 # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА: РУЧНОЙ ---
-@dp.message(F.text == "/mode_manual")
+@dp.message(Command("mode_manual"))
 async def mode_manual_cmd(message: types.Message):
     chat_id = message.chat.id
     set_chat_mode(chat_id, 'manual')
@@ -399,11 +448,11 @@ async def mode_manual_cmd(message: types.Message):
 
 
 # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА: ТЕМЫ ---
-@dp.message(F.text == "/mode_topic")
+@dp.message(Command("mode_topic"))
 async def mode_topic_cmd(message: types.Message):
     chat_id = message.chat.id
-    set_chat_mode(chat_id, 'topic')
-    await message.answer("🧵 Режим установлен: темы. Для каждой задачи создаётся отдельная тема с копией сообщения.")
+    set_topic_enabled(chat_id, True)
+    await message.answer("🧵 Режим тем включен. Для каждой задачи создаётся отдельная тема с копией сообщения.")
     try:
         await bot.delete_message(chat_id, message.message_id)
     except:
@@ -411,11 +460,34 @@ async def mode_topic_cmd(message: types.Message):
 
 
 # --- ПЕРЕКЛЮЧЕНИЕ РЕЖИМА: АВТО ---
-@dp.message(F.text == "/mode_auto")
+@dp.message(Command("mode_auto"))
 async def mode_auto_cmd(message: types.Message):
     chat_id = message.chat.id
     set_chat_mode(chat_id, 'auto')
     await message.answer("⚡ Режим установлен: авто. Новые сообщения сразу создают открытую задачу с кнопкой \"Закрыть задачу\".")
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
+# --- ВКЛ/ВЫКЛ РЕЖИМА ТЕМ ---
+@dp.message(Command("topic_on"))
+async def topic_on_cmd(message: types.Message):
+    chat_id = message.chat.id
+    set_topic_enabled(chat_id, True)
+    await message.answer("🧵 Режим тем: включен")
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
+@dp.message(Command("topic_off"))
+async def topic_off_cmd(message: types.Message):
+    chat_id = message.chat.id
+    set_topic_enabled(chat_id, False)
+    await message.answer("🧵 Режим тем: выключен")
     try:
         await bot.delete_message(chat_id, message.message_id)
     except:
@@ -443,6 +515,7 @@ async def handle_message(message: types.Message):
     # Определяем режим и формируем клавиатуру
     mode = get_chat_mode(chat_id)
     is_auto = (mode == 'auto')
+    topics = get_topic_enabled(chat_id)
     if is_auto:
         set_task_status(task_id, 'open')
         kb = InlineKeyboardMarkup(
@@ -485,14 +558,14 @@ async def handle_message(message: types.Message):
         logger.error(f"❌ Ошибка отправки сообщения для задачи #{task_id}: {e}")
     
     # В авто-режиме сразу обновляем закреп
-    if 'is_auto' in locals() and is_auto:
+    if is_auto:
         try:
             await update_pinned_message(chat_id)
         except Exception as e:
             logger.warning(f"⚠️ Не удалось обновить закреп в авто-режиме: {e}")
 
-    # В режиме тем создаём тему сразу для авто-режима
-    if get_chat_mode(chat_id) == 'topic' and is_auto and source_message_id:
+    # Если включены темы — создаём тему в авто-режиме сразу
+    if topics and is_auto and source_message_id:
         await create_task_topic_and_post(chat_id, task_id, source_message_id)
     
     # Удалить оригинальное сообщение (требуются права администратора)
@@ -525,8 +598,8 @@ async def create_task_callback(callback: types.CallbackQuery):
         # Обновляем закрепленное сообщение
         await update_pinned_message(callback.message.chat.id)
         
-        # В режиме тем создаём тему и публикуем сообщение
-        if get_chat_mode(callback.message.chat.id) == 'topic':
+        # Если включены темы — создаём тему и публикуем сообщение
+        if get_topic_enabled(callback.message.chat.id):
             await create_task_topic_and_post(callback.message.chat.id, task_id, callback.message.message_id)
         
     except Exception as e:
@@ -630,8 +703,8 @@ async def reopen_task_callback(callback: types.CallbackQuery):
         except Exception as e:
             logger.warning(f"⚠️ Не удалось обновить закреп: {e}")
 
-        # В режиме тем создаём новую тему и публикуем копию сообщения
-        if get_chat_mode(chat_id) == 'topic':
+        # Если включены темы — создаём новую тему и публикуем копию сообщения
+        if get_topic_enabled(chat_id):
             # Используем исходное сообщение (в общем потоке) как источник
             try:
                 source_msg_id = get_task_message_id(task_id)
@@ -691,6 +764,9 @@ async def main():
         logger.info("  • Кнопки создания и закрытия задач")
         logger.info("  • Автоматическое обновление закрепленного сообщения со статистикой")
         logger.info("=" * 50)
+        
+        # Регистрируем команды, чтобы при вводе '/' клиенты показывали список
+        await setup_bot_commands()
         
         # Инициализируем закрепленные сообщения для всех чатов
         await init_pins_for_all_chats()
