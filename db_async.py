@@ -49,6 +49,19 @@ async def get_task_topic_id(task_id):
     return row[0] if row else None
 
 
+async def update_task_topic_message_id(task_id: int, topic_message_id: Optional[int]):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE tasks SET topic_message_id=? WHERE id=?", (topic_message_id, task_id))
+        await db.commit()
+
+
+async def get_task_topic_message_id(task_id: int) -> Optional[int]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT topic_message_id FROM tasks WHERE id=?", (task_id,)) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
+
+
 # --- ЗАКРЫТИЕ ЗАДАЧИ ---
 async def close_task(task_id):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -260,3 +273,18 @@ async def get_period_stats(chat_id: int, start_iso: str, end_iso: str):
         ) as cursor:
             open_now = (await cursor.fetchone())[0]
     return created_cnt, closed_cnt, open_now
+
+
+async def get_tasks_for_keyboard_sync(chat_id: int, limit: int = 200) -> List[Tuple[int, str, Optional[int], Optional[int], Optional[int]]]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            """
+            SELECT id, status, message_id, topic_message_id, topic_id
+            FROM tasks
+            WHERE chat_id=? AND message_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit)
+        ) as cursor:
+            return await cursor.fetchall()

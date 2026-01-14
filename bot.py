@@ -26,7 +26,9 @@ from db_async import (
     upsert_chat_user, get_chat_users, get_all_chat_ids,
     get_chat_info_text, set_chat_info_text,
     get_chat_current_info_text, set_chat_current_info_text,
-    get_period_stats
+    get_period_stats,
+    update_task_topic_message_id,
+    get_tasks_for_keyboard_sync
 )
 
 # Загрузка токена из .env
@@ -53,6 +55,12 @@ PIN_UPDATE_TASKS = {}
 PIN_RETRY_TASKS = {}
 REPLYMARKUP_RETRY_TASKS = {}
 REPLYMARKUP_RETRY_PAYLOAD = {}
+CHAT_UPDATE_TASKS = {}
+CHAT_UPDATE_EVENTS = {}
+CHAT_UPDATE_FLAGS = {}
+PIN_CALL_TS = {}
+KB_CALL_TS = {}
+KB_RETRY_TASKS = {}
 TASK_LOCKS = {}
 CHAT_LOCKS = {}
 
@@ -64,6 +72,77 @@ def _throttled(store, key, min_interval: float) -> bool:
         return True
     store[key] = now
     return False
+
+
+async def _throttle_wait(store, key, min_interval: float) -> None:
+    now = asyncio.get_event_loop().time()
+    last = store.get(key, 0.0)
+    delta = now - last
+    if delta < min_interval:
+        await asyncio.sleep(min_interval - delta)
+    store[key] = asyncio.get_event_loop().time()
+
+
+def _get_chat_update_event(chat_id: int) -> asyncio.Event:
+    ev = CHAT_UPDATE_EVENTS.get(chat_id)
+    if ev is None:
+        ev = asyncio.Event()
+        CHAT_UPDATE_EVENTS[chat_id] = ev
+    return ev
+
+
+def _merge_chat_update_flags(chat_id: int, *, pin: bool = False, keyboards: bool = False) -> None:
+    flags = CHAT_UPDATE_FLAGS.get(chat_id)
+    if flags is None:
+        flags = {"pin": False, "keyboards": False}
+        CHAT_UPDATE_FLAGS[chat_id] = flags
+    if pin:
+        flags["pin"] = True
+    if keyboards:
+        flags["keyboards"] = True
+
+
+async def enqueue_chat_update(chat_id: int, *, pin: bool = False, keyboards: bool = False) -> None:
+    _merge_chat_update_flags(chat_id, pin=pin, keyboards=keyboards)
+    ev = _get_chat_update_event(chat_id)
+    ev.set()
+
+    task = CHAT_UPDATE_TASKS.get(chat_id)
+    if task is None or task.done():
+        CHAT_UPDATE_TASKS[chat_id] = asyncio.create_task(_chat_update_worker(chat_id))
+
+
+async def _chat_update_worker(chat_id: int) -> None:
+    ev = _get_chat_update_event(chat_id)
+    while True:
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=180)
+        except asyncio.TimeoutError:
+            # Нет активности — завершаем воркер
+            CHAT_UPDATE_TASKS.pop(chat_id, None)
+            CHAT_UPDATE_FLAGS.pop(chat_id, None)
+            CHAT_UPDATE_EVENTS.pop(chat_id, None)
+            return
+
+        ev.clear()
+        # небольшой debounce для объединения событий
+        await asyncio.sleep(0.5)
+
+        flags = CHAT_UPDATE_FLAGS.get(chat_id) or {"pin": False, "keyboards": False}
+        do_pin = bool(flags.get("pin"))
+        do_kb = bool(flags.get("keyboards"))
+        CHAT_UPDATE_FLAGS[chat_id] = {"pin": False, "keyboards": False}
+
+        try:
+            async with get_chat_lock(chat_id):
+                if do_kb:
+                    await _throttle_wait(KB_CALL_TS, chat_id, 1.0)
+                    await sync_task_keyboards(chat_id)
+                if do_pin:
+                    await _throttle_wait(PIN_CALL_TS, chat_id, 3.0)
+                    await update_pinned_message(chat_id)
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка воркера обновлений (chat={chat_id}): {e}")
 
 
 def _parse_retry_after_seconds(error_text: str) -> Optional[int]:
@@ -194,6 +273,7 @@ def init_db():
         created_at TEXT,
         message_id INTEGER,
         topic_id INTEGER,
+        topic_message_id INTEGER,
         closed_at TEXT
     )''')
     
@@ -236,6 +316,8 @@ def init_db():
         task_columns = [col[1] for col in c.fetchall()]
         if 'topic_id' not in task_columns:
             c.execute("ALTER TABLE tasks ADD COLUMN topic_id INTEGER")
+        if 'topic_message_id' not in task_columns:
+            c.execute("ALTER TABLE tasks ADD COLUMN topic_message_id INTEGER")
         if 'closed_at' not in task_columns:
             c.execute("ALTER TABLE tasks ADD COLUMN closed_at TEXT")
     except Exception as e:
@@ -286,7 +368,7 @@ async def create_task_topic_and_post(chat_id: int, task_id: int, source_message_
 
         # Пытаемся скопировать с подписью, при неудаче — без подписи
         try:
-            await bot.copy_message(
+            copied = await bot.copy_message(
                 chat_id=chat_id,
                 from_chat_id=chat_id,
                 message_id=source_message_id,
@@ -295,15 +377,21 @@ async def create_task_topic_and_post(chat_id: int, task_id: int, source_message_
                 caption=caption_html,
                 parse_mode="HTML"
             )
+            topic_msg_id = getattr(copied, "message_id", None)
+            if topic_msg_id:
+                await update_task_topic_message_id(task_id, topic_msg_id)
         except Exception as e:
             logger.warning(f"ℹ️ Не удалось добавить подпись при копировании в тему для задачи #{task_id}: {e}. Копирую без подписи")
-            await bot.copy_message(
+            copied = await bot.copy_message(
                 chat_id=chat_id,
                 from_chat_id=chat_id,
                 message_id=source_message_id,
                 message_thread_id=topic_id,
                 reply_markup=kb
             )
+            topic_msg_id = getattr(copied, "message_id", None)
+            if topic_msg_id:
+                await update_task_topic_message_id(task_id, topic_msg_id)
         logger.info(f"🧵 Создана тема (thread_id={topic_id}) и опубликовано сообщение для задачи #{task_id}")
     except Exception as e:
         logger.error(f"❌ Ошибка при создании темы для задачи #{task_id}: {e}")
@@ -459,9 +547,8 @@ async def schedule_update_pinned_message(chat_id: int, delay: float = 3.0):
     async def _delayed_pin():
         try:
             await asyncio.sleep(delay)
-            # Обновляем закреп с защитой через chat_lock
-            async with get_chat_lock(chat_id):
-                await update_pinned_message(chat_id)
+            # Все обновления проводим через очередь (последовательно, с коалесингом)
+            await enqueue_chat_update(chat_id, pin=True)
         except asyncio.CancelledError:
             pass  # Задача отменена — это нормально
         except Exception as e:
@@ -478,8 +565,7 @@ async def schedule_retry_update_pinned_message(chat_id: int, retry_after: int):
     async def _retry_pin():
         try:
             await asyncio.sleep(max(1, int(retry_after) + 1))
-            async with get_chat_lock(chat_id):
-                await update_pinned_message(chat_id)
+            await enqueue_chat_update(chat_id, pin=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -488,41 +574,77 @@ async def schedule_retry_update_pinned_message(chat_id: int, retry_after: int):
     PIN_RETRY_TASKS[chat_id] = asyncio.create_task(_retry_pin())
 
 
-async def schedule_retry_edit_reply_markup(chat_id: int, message_id: int, reply_markup, retry_after: int):
-    key = (chat_id, message_id)
-    REPLYMARKUP_RETRY_PAYLOAD[key] = reply_markup
-
-    existing = REPLYMARKUP_RETRY_TASKS.get(key)
+async def schedule_retry_chat_keyboards(chat_id: int, retry_after: int):
+    existing = KB_RETRY_TASKS.get(chat_id)
     if existing and not existing.done():
         return
 
-    async def _retry_markup():
-        wait = max(1, int(retry_after) + 1)
+    async def _retry_kb():
         try:
-            while True:
-                await asyncio.sleep(wait)
-                payload = REPLYMARKUP_RETRY_PAYLOAD.get(key)
-                if payload is None:
-                    return
-                try:
-                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=payload)
-                    return
-                except Exception as e:
-                    ra = _parse_retry_after_seconds(str(e))
-                    if ra:
-                        logger.warning(
-                            f"⚠️ Flood control на editReplyMarkup (chat={chat_id}, msg={message_id}). Retry after {ra}s"
-                        )
-                        wait = max(1, int(ra) + 1)
-                        continue
-                    logger.warning(f"⚠️ Не удалось обновить кнопки (chat={chat_id}, msg={message_id}): {e}")
-                    return
+            await asyncio.sleep(max(1, int(retry_after) + 1))
+            await enqueue_chat_update(chat_id, keyboards=True)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка retry-обновления кнопок (chat={chat_id}, msg={message_id}): {e}")
+            logger.warning(f"⚠️ Ошибка retry-обновления кнопок для чата {chat_id}: {e}")
 
-    REPLYMARKUP_RETRY_TASKS[key] = asyncio.create_task(_retry_markup())
+    KB_RETRY_TASKS[chat_id] = asyncio.create_task(_retry_kb())
+
+
+async def sync_task_keyboards(chat_id: int, limit: int = 200) -> None:
+    try:
+        tasks = await get_tasks_for_keyboard_sync(chat_id, limit=limit)
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось получить задачи для синхронизации кнопок (chat={chat_id}): {e}")
+        return
+
+    for task_id, status, msg_id, topic_msg_id, _topic_id in tasks:
+        kb = build_task_kb(task_id, status)
+
+        # Ограничиваем частоту апдейтов клавиатуры в чате, чтобы не ловить Flood control пачками
+        await _throttle_wait(KB_CALL_TS, chat_id, 0.35)
+
+        # Основной поток
+        if msg_id:
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+            except Exception as e:
+                err = str(e)
+                low = err.lower()
+                if "message is not modified" in low:
+                    logger.debug(f"KB not modified (chat={chat_id}, msg={msg_id})")
+                elif "message to edit not found" in low or "message not found" in low:
+                    logger.debug(f"KB message not found (chat={chat_id}, msg={msg_id})")
+                else:
+                    ra = _parse_retry_after_seconds(err)
+                    if ra:
+                        await schedule_retry_chat_keyboards(chat_id, ra)
+                        return
+                    logger.debug(f"KB update failed (chat={chat_id}, msg={msg_id}): {e}")
+
+        # Сообщение в теме (если есть)
+        if topic_msg_id:
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=topic_msg_id, reply_markup=kb)
+            except Exception as e:
+                err = str(e)
+                low = err.lower()
+                if "message is not modified" in low:
+                    logger.debug(f"KB not modified (chat={chat_id}, msg={topic_msg_id})")
+                elif "message to edit not found" in low or "message not found" in low:
+                    logger.debug(f"KB message not found (chat={chat_id}, msg={topic_msg_id})")
+                else:
+                    ra = _parse_retry_after_seconds(err)
+                    if ra:
+                        await schedule_retry_chat_keyboards(chat_id, ra)
+                        return
+                    logger.debug(f"KB update failed (chat={chat_id}, msg={topic_msg_id}): {e}")
+
+
+async def schedule_retry_edit_reply_markup(chat_id: int, message_id: int, reply_markup, retry_after: int):
+    # Не делаем десятки параллельных retry по каждому сообщению — это только усугубляет Flood control.
+    # Вместо этого планируем один повтор "ремонта кнопок" на весь чат.
+    await schedule_retry_chat_keyboards(chat_id, retry_after)
 
 
 # --- КОМАНДА /start ---
@@ -541,8 +663,8 @@ async def refresh_cmd(message: types.Message):
         await track_user(chat_id, message.from_user)
         logger.info(f"🔄 Получена команда /refresh от @{message.from_user.username} в чате {chat_id}")
         
-        # Обновляем закреп (сначала попытка редактирования существующего; при неудаче — создание нового)
-        await update_pinned_message(chat_id)
+        # Ремонтное обновление: закреп + синхронизация кнопок на задачах
+        await enqueue_chat_update(chat_id, pin=True, keyboards=True)
         
         # Удаляем команду пользователя
         try:
@@ -874,8 +996,7 @@ async def handle_message(message: types.Message):
     chat_id = message.chat.id
     await track_user(chat_id, message.from_user)
     # Throttle message spam per chat+user
-    if _throttled(LAST_MSG_TS, (chat_id, message.from_user.id), 0.8):
-        return
+    await _throttle_wait(LAST_MSG_TS, (chat_id, message.from_user.id), 0.8)
     username = message.from_user.username or message.from_user.full_name or "Аноним"
     text = message.text or message.caption or "(медиа без текста)"
     # Формируем подпись автора: @username если есть, иначе имя без @
@@ -983,13 +1104,8 @@ async def create_task_callback(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
         await track_user(chat_id, callback.from_user)
-        # Throttle callback spam per chat+user
-        if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
-            try:
-                await callback.answer("Слишком часто. Подождите...", show_alert=True)
-            except:
-                pass
-            return
+        # Throttle callback spam per chat+user (не теряем события — ждём)
+        await _throttle_wait(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5)
         task_id = int(callback.data.split("_")[1])
         
         # Lock для защиты от параллельных операций
@@ -1023,8 +1139,8 @@ async def create_task_callback(callback: types.CallbackQuery):
             await callback.answer("Задача создана ✅", show_alert=False)
             logger.info(f"✅ Задача #{task_id} принята в работу пользователем @{callback.from_user.username}")
             
-            # Обновляем закрепленное сообщение
-            await schedule_update_pinned_message(callback.message.chat.id)
+            # Ремонтное обновление через очередь (закреп + кнопки)
+            await enqueue_chat_update(chat_id, pin=True, keyboards=True)
         
         # Если включены темы — создаём тему и публикуем сообщение (ВНЕ lock!)
         if await get_topic_enabled(callback.message.chat.id):
@@ -1044,13 +1160,8 @@ async def close_task_callback(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
         await track_user(chat_id, callback.from_user)
-        # Throttle callback spam per chat+user
-        if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
-            try:
-                await callback.answer("Слишком часто. Подождите...", show_alert=True)
-            except:
-                pass
-            return
+        # Throttle callback spam per chat+user (не теряем события — ждём)
+        await _throttle_wait(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5)
         task_id = int(callback.data.split("_")[1])
         
         # Lock для защиты от параллельных операций
@@ -1114,9 +1225,9 @@ async def close_task_callback(callback: types.CallbackQuery):
             except:
                 pass
             try:
-                await schedule_update_pinned_message(chat_id)
+                await enqueue_chat_update(chat_id, pin=True, keyboards=True)
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось обновить закреп: {e}")
+                logger.warning(f"⚠️ Не удалось поставить обновление в очередь: {e}")
 
             logger.info(f"🔒 Задача #{task_id} закрыта пользователем @{callback.from_user.username}")
         
@@ -1146,13 +1257,8 @@ async def reopen_task_callback(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
         await track_user(chat_id, callback.from_user)
-        # Throttle callback spam per chat+user
-        if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
-            try:
-                await callback.answer("Слишком часто. Подождите...", show_alert=True)
-            except:
-                pass
-            return
+        # Throttle callback spam per chat+user (не теряем события — ждём)
+        await _throttle_wait(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5)
         task_id = int(callback.data.split("_")[1])
         
         # Lock для защиты от параллельных операций
@@ -1199,9 +1305,9 @@ async def reopen_task_callback(callback: types.CallbackQuery):
             except:
                 pass
             try:
-                await schedule_update_pinned_message(chat_id)
+                await enqueue_chat_update(chat_id, pin=True, keyboards=True)
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось обновить закреп: {e}")
+                logger.warning(f"⚠️ Не удалось поставить обновление в очередь: {e}")
 
             logger.info(f"🔓 Задача #{task_id} переоткрыта пользователем @{callback.from_user.username}")
         
@@ -1239,7 +1345,7 @@ async def init_pins_for_all_chats():
                 pin_id = await get_pin_message_id(chat_id)
                 if not pin_id:
                     logger.info(f"🔄 Создаю закрепленное сообщение для чата {chat_id}")
-                    await update_pinned_message(chat_id)
+                    await enqueue_chat_update(chat_id, pin=True)
                 else:
                     logger.info(f"✅ Закреп уже существует для чата {chat_id} (message_id: {pin_id})")
         else:
