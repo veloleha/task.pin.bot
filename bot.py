@@ -2,10 +2,12 @@ import asyncio
 import logging
 import aiosqlite
 import sqlite3  # Только для init_db
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import re
 from dotenv import load_dotenv
 import html
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,15 +18,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from db_async import (
     add_task, update_task_message_id, get_task_message_id,
     update_task_topic_id, get_task_topic_id, close_task,
+    reopen_task,
     set_task_status, get_task_status, get_stats,
     get_pin_message_id, save_pin_message_id,
     get_chat_mode, set_chat_mode,
-    get_topic_enabled, set_topic_enabled
+    get_topic_enabled, set_topic_enabled,
+    upsert_chat_user, get_chat_users, get_all_chat_ids,
+    get_chat_info_text, set_chat_info_text,
+    get_chat_current_info_text, set_chat_current_info_text,
+    get_period_stats
 )
 
 # Загрузка токена из .env
 load_dotenv()
-API_TOKEN = os.getenv("BOT_TOKEN")
+API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("\ufeffBOT_TOKEN")
 
 if not API_TOKEN:
     raise ValueError("❌ BOT_TOKEN не найден в .env файле!")
@@ -43,6 +50,9 @@ LAST_MSG_TS = {}
 LAST_CB_TS = {}
 
 PIN_UPDATE_TASKS = {}
+PIN_RETRY_TASKS = {}
+REPLYMARKUP_RETRY_TASKS = {}
+REPLYMARKUP_RETRY_PAYLOAD = {}
 TASK_LOCKS = {}
 CHAT_LOCKS = {}
 
@@ -54,6 +64,16 @@ def _throttled(store, key, min_interval: float) -> bool:
         return True
     store[key] = now
     return False
+
+
+def _parse_retry_after_seconds(error_text: str) -> Optional[int]:
+    try:
+        m = re.search(r"retry after\s+(\d+)", (error_text or "").lower())
+        if not m:
+            return None
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 def get_task_lock(task_id):
@@ -72,6 +92,92 @@ def get_chat_lock(chat_id):
 DB_NAME = "tasks.db"
 
 
+def build_task_kb(task_id: int, status: str) -> InlineKeyboardMarkup:
+    if status == 'open':
+        main_btn = InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")
+    elif status == 'closed':
+        main_btn = InlineKeyboardButton(text="♻️ Переоткрыть", callback_data=f"reopen_{task_id}")
+    else:
+        main_btn = InlineKeyboardButton(text="📝 Создать задачу", callback_data=f"create_{task_id}")
+    info_btn = InlineKeyboardButton(text="ℹ️", callback_data="info")
+    cur_btn = InlineKeyboardButton(text="🔑", callback_data="current_info")
+    return InlineKeyboardMarkup(inline_keyboard=[[main_btn], [info_btn, cur_btn]])
+
+
+async def track_user(chat_id: int, user: types.User):
+    try:
+        await upsert_chat_user(chat_id, user.id, user.username, user.full_name)
+    except Exception as e:
+        logger.debug(f"User tracking failed: {e}")
+
+
+async def is_user_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        status = getattr(member, "status", "")
+        return status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def check_bot_permissions(chat_id: int, require_delete: bool = True, require_pin: bool = True) -> bool:
+    """Проверка прав бота в чате."""
+    try:
+        member = await bot.get_chat_member(chat_id, bot.id)
+        status = getattr(member, "status", "")
+        if status in ("administrator", "creator"):
+            can_delete = getattr(member, "can_delete_messages", False)
+            can_pin = getattr(member, "can_pin_messages", False)
+
+            if require_delete and not can_delete:
+                logger.warning(f"⛔ Недостаточно прав: delete={can_delete}, pin={can_pin} в чате {chat_id}")
+                return False
+            if require_pin and not can_pin:
+                logger.warning(f"⛔ Недостаточно прав: delete={can_delete}, pin={can_pin} в чате {chat_id}")
+                return False
+            return True
+        logger.warning(f"⛔ Бот не администратор в чате {chat_id} (status={status})")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось проверить права бота в чате {chat_id}: {e}")
+        return False
+
+
+async def delete_message_safe(chat_id: int, message_id: int):
+    """Безопасное удаление сообщения с обработкой ошибок"""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.debug(f"🗑️ Удалено сообщение {message_id}")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
+
+
+async def send_text_same_place(callback: types.CallbackQuery, text: str):
+    thread_id = getattr(callback.message, "message_thread_id", None)
+    await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        message_thread_id=thread_id
+    )
+
+
+def fmt_user_mention(user_id: int, username: Optional[str], full_name: Optional[str]) -> str:
+    if username:
+        return f"@{html.escape(username)}"
+    name = html.escape(full_name or str(user_id))
+    return f"<a href=\"tg://user?id={user_id}\">{name}</a>"
+
+
+async def build_mentions_text(chat_id: int) -> str:
+    users = await get_chat_users(chat_id)
+    mentions = []
+    for user_id, username, full_name in users:
+        mentions.append(fmt_user_mention(user_id, username, full_name))
+    return " ".join(mentions)
+
+
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -86,13 +192,28 @@ def init_db():
         text TEXT,
         status TEXT DEFAULT 'open',
         created_at TEXT,
-        message_id INTEGER
+        message_id INTEGER,
+        topic_id INTEGER,
+        closed_at TEXT
     )''')
     
     # Таблица для хранения pin_message_id для каждого чата
     c.execute('''CREATE TABLE IF NOT EXISTS chats (
         chat_id INTEGER PRIMARY KEY,
-        pin_message_id INTEGER
+        pin_message_id INTEGER,
+        mode TEXT DEFAULT 'manual',
+        topic_enabled INTEGER DEFAULT 0,
+        info_text TEXT,
+        current_info_text TEXT
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_users (
+        chat_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        full_name TEXT,
+        last_seen TEXT,
+        PRIMARY KEY (chat_id, user_id)
     )''')
     # Добавляем колонку режима при необходимости
     try:
@@ -102,6 +223,10 @@ def init_db():
             c.execute("ALTER TABLE chats ADD COLUMN mode TEXT DEFAULT 'manual'")
         if 'topic_enabled' not in columns:
             c.execute("ALTER TABLE chats ADD COLUMN topic_enabled INTEGER DEFAULT 0")
+        if 'info_text' not in columns:
+            c.execute("ALTER TABLE chats ADD COLUMN info_text TEXT")
+        if 'current_info_text' not in columns:
+            c.execute("ALTER TABLE chats ADD COLUMN current_info_text TEXT")
     except Exception as e:
         logger.warning(f"⚠️ Не удалось добавить колонку mode: {e}")
     
@@ -111,6 +236,8 @@ def init_db():
         task_columns = [col[1] for col in c.fetchall()]
         if 'topic_id' not in task_columns:
             c.execute("ALTER TABLE tasks ADD COLUMN topic_id INTEGER")
+        if 'closed_at' not in task_columns:
+            c.execute("ALTER TABLE tasks ADD COLUMN closed_at TEXT")
     except Exception as e:
         logger.warning(f"⚠️ Не удалось добавить колонку topic_id: {e}")
     
@@ -141,9 +268,7 @@ async def create_task_topic_and_post(chat_id: int, task_id: int, source_message_
         await update_task_topic_id(task_id, topic_id)
 
         # Копируем исходное сообщение в тему (клавиатура копируется вместе)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
-        )
+        kb = build_task_kb(task_id, 'open')
         # Получаем автора и текст для подписи
         try:
             import aiosqlite
@@ -191,9 +316,13 @@ async def setup_bot_commands():
         types.BotCommand(command="refresh", description="Обновить закреп"),
         types.BotCommand(command="mode_manual", description="Режим: вручную"),
         types.BotCommand(command="mode_auto", description="Режим: авто"),
-        types.BotCommand(command="mode_topic", description="Режим: темы"),
         types.BotCommand(command="topic_on", description="Включить режим тем"),
         types.BotCommand(command="topic_off", description="Выключить режим тем"),
+        types.BotCommand(command="set_info", description="Установить инструкцию (/set_info текст)"),
+        types.BotCommand(command="set_current_info", description="Установить текущую инфо (/set_current_info текст)"),
+        types.BotCommand(command="stats", description="Статистика за период"),
+        types.BotCommand(command="announce", description="Инфо-оповещение в текущий чат"),
+        types.BotCommand(command="announce_all", description="Инфо-оповещение во все чаты (private)"),
         types.BotCommand(command="reset", description="Сброс БД и закрепа (с подтверждением)"),
     ]
     try:
@@ -204,40 +333,37 @@ async def setup_bot_commands():
     except Exception as e:
         logger.warning(f"⚠️ Не удалось установить список команд бота: {e}")
 
-# --- ПРОВЕРКА ПРАВ БОТА ---
-async def check_bot_permissions(chat_id):
-    try:
-        member = await bot.get_chat_member(chat_id, bot.id)
-        status = getattr(member, "status", "")
-        if status in ("administrator", "creator"):
-            can_delete = getattr(member, "can_delete_messages", False)
-            can_pin = getattr(member, "can_pin_messages", False)
-            if can_delete and can_pin:
-                return True
-            logger.warning(f"⛔ Недостаточно прав: delete={can_delete}, pin={can_pin} в чате {chat_id}")
-            return False
-        logger.warning(f"⛔ Бот не администратор в чате {chat_id} (status={status})")
-        return False
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось проверить права бота в чате {chat_id}: {e}")
-        return False
-
-async def delete_message_safe(chat_id: int, message_id: int):
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.debug(f"🗑️ Удалено сообщение {message_id}")
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
-
 
 # --- ОБНОВЛЕНИЕ ЗАКРЕПЛЕННОГО СООБЩЕНИЯ ---
 async def update_pinned_message(chat_id):
     # Проверяем права бота перед обновлением закрепа
-    if not await check_bot_permissions(chat_id):
+    if not await check_bot_permissions(chat_id, require_delete=False, require_pin=True):
         logger.warning(f"⛔ Не могу обновить закреп в чате {chat_id} - недостаточно прав")
         return
     
     pin_message_id = await get_pin_message_id(chat_id)
+    # Синхронизация с реальным закрепом в Telegram: в БД мог остаться старый message_id
+    # или закреп могли поменять вручную.
+    try:
+        chat = await bot.get_chat(chat_id)
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned:
+            actual_pinned_id = getattr(pinned, "message_id", None)
+            pinned_from_id = getattr(getattr(pinned, "from_user", None), "id", None)
+            if actual_pinned_id and pinned_from_id == bot.id:
+                if pin_message_id != actual_pinned_id:
+                    logger.info(
+                        f"📌 Синхронизация закрепа в чате {chat_id}: БД={pin_message_id}, факт={actual_pinned_id}"
+                    )
+                    pin_message_id = actual_pinned_id
+                    await save_pin_message_id(chat_id, actual_pinned_id)
+            elif actual_pinned_id and pin_message_id and actual_pinned_id != pin_message_id:
+                logger.warning(
+                    f"⚠️ Закреп в чате {chat_id} заменён другим сообщением (id={actual_pinned_id}). Создам новый закреп от бота."
+                )
+                pin_message_id = None
+    except Exception as e:
+        logger.debug(f"Не удалось получить текущий закреп в чате {chat_id} через get_chat: {e}")
     open_tasks, closed_tasks, open_list = await get_stats(chat_id)
 
     # Формирование текста в HTML с экранированием пользовательских данных
@@ -277,10 +403,18 @@ async def update_pinned_message(chat_id):
                     parse_mode="HTML",
                     disable_web_page_preview=True
                 )
+                # Важно: не дергаем pinChatMessage на каждый апдейт — это быстро приводит к Flood control.
                 logger.info(f"✅ Обновлено закрепленное сообщение {pin_message_id}")
                 return
             except Exception as e:
                 error_msg = str(e).lower()
+                retry_after = _parse_retry_after_seconds(error_msg)
+                if retry_after:
+                    logger.warning(
+                        f"⚠️ Flood control на editMessageText в чате {chat_id}. Retry after {retry_after}s"
+                    )
+                    await schedule_retry_update_pinned_message(chat_id, retry_after)
+                    return
                 # Сообщение не изменилось — редактирование не требуется, ничего не создаем
                 if "message is not modified" in error_msg:
                     logger.info("ℹ️ Текст закрепленного сообщения не изменился — редактирование не требуется")
@@ -314,7 +448,8 @@ async def update_pinned_message(chat_id):
     except Exception as e:
         logger.error(f"❌ Ошибка при обновлении закрепа: {e}")
 
-async def schedule_update_pinned_message(chat_id: int, delay: float = 0.7):
+
+async def schedule_update_pinned_message(chat_id: int, delay: float = 3.0):
     """Debounce обновления закрепа: отменяет предыдущую задачу и планирует новую"""
     # Отменяем предыдущую задачу обновления для этого чата
     existing = PIN_UPDATE_TASKS.get(chat_id)
@@ -335,9 +470,65 @@ async def schedule_update_pinned_message(chat_id: int, delay: float = 0.7):
     PIN_UPDATE_TASKS[chat_id] = asyncio.create_task(_delayed_pin())
 
 
+async def schedule_retry_update_pinned_message(chat_id: int, retry_after: int):
+    existing = PIN_RETRY_TASKS.get(chat_id)
+    if existing and not existing.done():
+        return
+
+    async def _retry_pin():
+        try:
+            await asyncio.sleep(max(1, int(retry_after) + 1))
+            async with get_chat_lock(chat_id):
+                await update_pinned_message(chat_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка retry-обновления закрепа для чата {chat_id}: {e}")
+
+    PIN_RETRY_TASKS[chat_id] = asyncio.create_task(_retry_pin())
+
+
+async def schedule_retry_edit_reply_markup(chat_id: int, message_id: int, reply_markup, retry_after: int):
+    key = (chat_id, message_id)
+    REPLYMARKUP_RETRY_PAYLOAD[key] = reply_markup
+
+    existing = REPLYMARKUP_RETRY_TASKS.get(key)
+    if existing and not existing.done():
+        return
+
+    async def _retry_markup():
+        wait = max(1, int(retry_after) + 1)
+        try:
+            while True:
+                await asyncio.sleep(wait)
+                payload = REPLYMARKUP_RETRY_PAYLOAD.get(key)
+                if payload is None:
+                    return
+                try:
+                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=payload)
+                    return
+                except Exception as e:
+                    ra = _parse_retry_after_seconds(str(e))
+                    if ra:
+                        logger.warning(
+                            f"⚠️ Flood control на editReplyMarkup (chat={chat_id}, msg={message_id}). Retry after {ra}s"
+                        )
+                        wait = max(1, int(ra) + 1)
+                        continue
+                    logger.warning(f"⚠️ Не удалось обновить кнопки (chat={chat_id}, msg={message_id}): {e}")
+                    return
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка retry-обновления кнопок (chat={chat_id}, msg={message_id}): {e}")
+
+    REPLYMARKUP_RETRY_TASKS[key] = asyncio.create_task(_retry_markup())
+
+
 # --- КОМАНДА /start ---
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
+    await track_user(message.chat.id, message.from_user)
     await message.answer("✅ TaskPinBot запущен!\nПросто напишите сообщение — я добавлю кнопку для создания задачи.\n\n📌 Команды:\n/refresh - Обновить закрепленное сообщение")
 
 
@@ -347,6 +538,7 @@ async def refresh_cmd(message: types.Message):
     """Принудительное обновление закрепленного сообщения"""
     try:
         chat_id = message.chat.id
+        await track_user(chat_id, message.from_user)
         logger.info(f"🔄 Получена команда /refresh от @{message.from_user.username} в чате {chat_id}")
         
         # Обновляем закреп (сначала попытка редактирования существующего; при неудаче — создание нового)
@@ -369,6 +561,7 @@ async def refresh_cmd(message: types.Message):
 @dp.message(Command("mode_manual"))
 async def mode_manual_cmd(message: types.Message):
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     await set_chat_mode(chat_id, 'manual')
     await message.answer("🛠️ Режим установлен: ручной. Задачи открываются по кнопке \"Создать задачу\".")
     try:
@@ -381,6 +574,7 @@ async def mode_manual_cmd(message: types.Message):
 @dp.message(Command("mode_topic"))
 async def mode_topic_cmd(message: types.Message):
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     await set_topic_enabled(chat_id, True)
     await message.answer("🧵 Режим тем включен. Для каждой задачи создаётся отдельная тема с копией сообщения.")
     try:
@@ -393,6 +587,7 @@ async def mode_topic_cmd(message: types.Message):
 @dp.message(Command("mode_auto"))
 async def mode_auto_cmd(message: types.Message):
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     await set_chat_mode(chat_id, 'auto')
     await message.answer("⚡ Режим установлен: авто. Новые сообщения сразу создают открытую задачу с кнопкой \"Закрыть задачу\".")
     try:
@@ -405,6 +600,7 @@ async def mode_auto_cmd(message: types.Message):
 @dp.message(Command("topic_on"))
 async def topic_on_cmd(message: types.Message):
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     await set_topic_enabled(chat_id, True)
     await message.answer("🧵 Режим тем: включен")
     try:
@@ -416,12 +612,182 @@ async def topic_on_cmd(message: types.Message):
 @dp.message(Command("topic_off"))
 async def topic_off_cmd(message: types.Message):
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     await set_topic_enabled(chat_id, False)
     await message.answer("🧵 Режим тем: выключен")
     try:
         await bot.delete_message(chat_id, message.message_id)
     except:
         pass
+
+
+@dp.message(Command("set_info"))
+async def set_info_cmd(message: types.Message):
+    chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
+    if message.chat.type != "private" and not await is_user_admin(chat_id, message.from_user.id):
+        await message.answer("⛔ Только администратор может менять инструкцию")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /set_info <текст инструкции>")
+        return
+    await set_chat_info_text(chat_id, parts[1].strip())
+    await message.answer("✅ Инструкция обновлена")
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
+@dp.message(Command("set_current_info"))
+async def set_current_info_cmd(message: types.Message):
+    chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
+    if message.chat.type != "private" and not await is_user_admin(chat_id, message.from_user.id):
+        await message.answer("⛔ Только администратор может менять текущую информацию")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /set_current_info <текст (пароль/ссылки/инфо)>")
+        return
+    await set_chat_current_info_text(chat_id, parts[1].strip())
+    await message.answer("✅ Текущая информация обновлена")
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: types.Message):
+    chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
+    parts = (message.text or "").split()
+    now = datetime.now()
+    if len(parts) == 1:
+        start = (now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=6))
+        end = now
+    elif len(parts) == 2 and parts[1].isdigit():
+        days = max(1, min(int(parts[1]), 3650))
+        start = (now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1))
+        end = now
+    elif len(parts) >= 3:
+        try:
+            start = datetime.fromisoformat(parts[1]).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = datetime.fromisoformat(parts[2]).replace(hour=23, minute=59, second=59, microsecond=999999)
+        except Exception:
+            await message.answer("Использование: /stats [дней] или /stats YYYY-MM-DD YYYY-MM-DD")
+            return
+    else:
+        await message.answer("Использование: /stats [дней] или /stats YYYY-MM-DD YYYY-MM-DD")
+        return
+
+    created_cnt, closed_cnt, open_now = await get_period_stats(chat_id, start.isoformat(), end.isoformat())
+    await message.answer(
+        "<b>📊 Статистика</b>\n\n"
+        f"Период: <code>{html.escape(start.date().isoformat())}</code> — <code>{html.escape(end.date().isoformat())}</code>\n"
+        f"Создано задач: <b>{created_cnt}</b>\n"
+        f"Закрыто задач: <b>{closed_cnt}</b>\n"
+        f"Открыто сейчас: <b>{open_now}</b>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("announce"))
+async def announce_cmd(message: types.Message):
+    chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
+    if message.chat.type != "private" and not await is_user_admin(chat_id, message.from_user.id):
+        await message.answer("⛔ Только администратор может делать оповещения")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /announce <текст оповещения>")
+        return
+    body = html.escape(parts[1].strip())
+    mentions = await build_mentions_text(chat_id)
+    base_text = f"<b>📢 Оповещение</b>\n\n{body}" if body else "<b>📢 Оповещение</b>"
+    if not mentions:
+        await message.answer(base_text, parse_mode="HTML", disable_web_page_preview=True)
+    else:
+        text = base_text + "\n\n" + mentions
+        if len(text) <= 3800:
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await message.answer(base_text, parse_mode="HTML", disable_web_page_preview=True)
+            chunk = ""
+            for m in mentions.split(" "):
+                if len(chunk) + len(m) + 1 > 3800:
+                    await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+                    chunk = m
+                else:
+                    chunk = (chunk + " " + m).strip()
+            if chunk:
+                await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    try:
+        await bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
+
+
+@dp.message(Command("announce_all"))
+async def announce_all_cmd(message: types.Message):
+    await track_user(message.chat.id, message.from_user)
+    if message.chat.type != "private":
+        await message.answer("Эта команда работает только в личке с ботом")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /announce_all <текст оповещения>")
+        return
+    body = html.escape(parts[1].strip())
+    base_text = f"<b>📢 Оповещение</b>\n\n{body}" if body else "<b>📢 Оповещение</b>"
+    sent = 0
+    failed = 0
+    for chat_id in await get_all_chat_ids():
+        if not await is_user_admin(chat_id, message.from_user.id):
+            continue
+        try:
+            mentions = await build_mentions_text(chat_id)
+            text = base_text + ("\n\n" + mentions if mentions else "")
+            if len(text) > 3900:
+                text = base_text
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+            sent += 1
+        except Exception:
+            failed += 1
+    await message.answer(f"Готово. Отправлено: {sent}. Ошибок: {failed}.")
+
+
+@dp.callback_query(F.data == "info")
+async def info_callback(callback: types.CallbackQuery):
+    await callback.answer("ℹ️")
+    await track_user(callback.message.chat.id, callback.from_user)
+    saved = await get_chat_info_text(callback.message.chat.id)
+    if saved:
+        text = saved if "<" in saved else html.escape(saved)
+    else:
+        text = (
+            "<b>ℹ️ Инструкция</b>\n\n"
+            "1) Напишите сообщение — бот перешлёт его от себя.\n"
+            "2) Нажмите <b>📝</b>, чтобы создать задачу (или включите /mode_auto).\n"
+            "3) Нажмите <b>✅</b>, чтобы закрыть задачу.\n\n"
+            "Для техподдержки: бот должен быть админом с правами удаления/закрепления."
+        )
+    await send_text_same_place(callback, text)
+
+
+@dp.callback_query(F.data == "current_info")
+async def current_info_callback(callback: types.CallbackQuery):
+    await callback.answer("🔑")
+    await track_user(callback.message.chat.id, callback.from_user)
+    saved = await get_chat_current_info_text(callback.message.chat.id)
+    if saved:
+        text = saved if "<" in saved else html.escape(saved)
+    else:
+        text = "Текущая информация не задана. Админ: /set_current_info ..."
+    await send_text_same_place(callback, text)
 
 
 # --- СБРОС БД И ЗАКРЕПА ---
@@ -431,13 +797,14 @@ RESET_CONFIRMATIONS = {}
 async def reset_cmd(message: types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
+    await track_user(chat_id, message.from_user)
     
     # Проверяем, есть ли уже запрос на подтверждение
     if RESET_CONFIRMATIONS.get((chat_id, user_id)):
         # Подтверждение получено — выполняем сброс
         try:
             # Удаляем закреп
-            pin_id = get_pin_message_id(chat_id)
+            pin_id = await get_pin_message_id(chat_id)
             if pin_id:
                 try:
                     await bot.unpin_chat_message(chat_id, pin_id)
@@ -450,9 +817,9 @@ async def reset_cmd(message: types.Message):
             conn = sqlite3.connect(DB_NAME)
             c = conn.cursor()
             c.execute("DELETE FROM tasks WHERE chat_id=?", (chat_id,))
+            deleted_tasks = c.rowcount
             c.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
             conn.commit()
-            deleted_tasks = c.rowcount
             conn.close()
             
             RESET_CONFIRMATIONS.pop((chat_id, user_id), None)
@@ -505,6 +872,7 @@ async def handle_message(message: types.Message):
         return
 
     chat_id = message.chat.id
+    await track_user(chat_id, message.from_user)
     # Throttle message spam per chat+user
     if _throttled(LAST_MSG_TS, (chat_id, message.from_user.id), 0.8):
         return
@@ -527,13 +895,9 @@ async def handle_message(message: types.Message):
     topics = await get_topic_enabled(chat_id)
     if is_auto:
         await set_task_status(task_id, 'open')
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
-        )
+        kb = build_task_kb(task_id, 'open')
     else:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📝 Создать задачу", callback_data=f"create_{task_id}")]]
-        )
+        kb = build_task_kb(task_id, 'new')
 
     source_message_id = None
     try:
@@ -618,6 +982,7 @@ async def create_task_callback(callback: types.CallbackQuery):
     
     try:
         chat_id = callback.message.chat.id
+        await track_user(chat_id, callback.from_user)
         # Throttle callback spam per chat+user
         if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
             try:
@@ -647,12 +1012,14 @@ async def create_task_callback(callback: types.CallbackQuery):
             await set_task_status(task_id, 'open')
             
             # Меняем кнопку на "Закрыть задачу"
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]
-                ]
-            )
-            await callback.message.edit_reply_markup(reply_markup=kb)
+            kb = build_task_kb(task_id, 'open')
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb)
+            except Exception as e:
+                retry_after = _parse_retry_after_seconds(str(e))
+                if retry_after:
+                    await schedule_retry_edit_reply_markup(chat_id, callback.message.message_id, kb, retry_after)
+                logger.warning(f"⚠️ Не удалось обновить кнопку текущего сообщения: {e}")
             await callback.answer("Задача создана ✅", show_alert=False)
             logger.info(f"✅ Задача #{task_id} принята в работу пользователем @{callback.from_user.username}")
             
@@ -676,6 +1043,7 @@ async def close_task_callback(callback: types.CallbackQuery):
     
     try:
         chat_id = callback.message.chat.id
+        await track_user(chat_id, callback.from_user)
         # Throttle callback spam per chat+user
         if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
             try:
@@ -702,15 +1070,16 @@ async def close_task_callback(callback: types.CallbackQuery):
             await close_task(task_id)
 
             # 2) Меняем кнопку на "Переоткрыть"
-            kb_reopen = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="♻️ Переоткрыть", callback_data=f"reopen_{task_id}")]]
-            )
+            kb_reopen = build_task_kb(task_id, 'closed')
             
             # Обновляем кнопку на текущем сообщении (где был клик)
             try:
                 await callback.message.edit_reply_markup(reply_markup=kb_reopen)
                 logger.debug(f"✅ Обновлена кнопка на текущем сообщении задачи #{task_id}")
             except Exception as e:
+                retry_after = _parse_retry_after_seconds(str(e))
+                if retry_after:
+                    await schedule_retry_edit_reply_markup(chat_id, callback.message.message_id, kb_reopen, retry_after)
                 logger.warning(f"⚠️ Не удалось обновить кнопку текущего сообщения: {e}")
             
             # Если клик был в теме, обновим также исходное сообщение в общем потоке
@@ -718,8 +1087,14 @@ async def close_task_callback(callback: types.CallbackQuery):
                 try:
                     orig_msg_id = await get_task_message_id(task_id)
                     if orig_msg_id:
-                        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_reopen)
-                        logger.debug(f"✅ Обновлена кнопка на исходном сообщении задачи #{task_id}")
+                        try:
+                            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_reopen)
+                            logger.debug(f"✅ Обновлена кнопка на исходном сообщении задачи #{task_id}")
+                        except Exception as e:
+                            retry_after = _parse_retry_after_seconds(str(e))
+                            if retry_after:
+                                await schedule_retry_edit_reply_markup(chat_id, orig_msg_id, kb_reopen, retry_after)
+                            raise
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось обновить кнопки исходного сообщения задачи #{task_id}: {e}")
 
@@ -770,6 +1145,7 @@ async def reopen_task_callback(callback: types.CallbackQuery):
     
     try:
         chat_id = callback.message.chat.id
+        await track_user(chat_id, callback.from_user)
         # Throttle callback spam per chat+user
         if _throttled(LAST_CB_TS, (chat_id, callback.from_user.id), 0.5):
             try:
@@ -790,18 +1166,30 @@ async def reopen_task_callback(callback: types.CallbackQuery):
                 except:
                     pass
                 return
-            await set_task_status(task_id, 'open')
+            await reopen_task(task_id)
 
-            # Кнопка "Закрыть" для исходного сообщения
-            kb_close = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
-            )
+            kb_close = build_task_kb(task_id, 'open')
+
+            # Обновляем кнопки на текущем сообщении
+            try:
+                await callback.message.edit_reply_markup(reply_markup=kb_close)
+            except Exception as e:
+                retry_after = _parse_retry_after_seconds(str(e))
+                if retry_after:
+                    await schedule_retry_edit_reply_markup(chat_id, callback.message.message_id, kb_close, retry_after)
+                logger.warning(f"⚠️ Не удалось обновить кнопки текущего сообщения при переоткрытии задачи #{task_id}: {e}")
 
             # Обновляем кнопки на исходном сообщении
             try:
                 orig_msg_id = await get_task_message_id(task_id)
                 if orig_msg_id:
-                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_close)
+                    try:
+                        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=orig_msg_id, reply_markup=kb_close)
+                    except Exception as e:
+                        retry_after = _parse_retry_after_seconds(str(e))
+                        if retry_after:
+                            await schedule_retry_edit_reply_markup(chat_id, orig_msg_id, kb_close, retry_after)
+                        raise
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось обновить кнопки исходного сообщения при переоткрытии задачи #{task_id}: {e}")
 

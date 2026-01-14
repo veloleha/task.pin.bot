@@ -2,6 +2,7 @@
 import aiosqlite
 from datetime import datetime
 import logging
+from typing import Optional, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,19 @@ async def get_task_topic_id(task_id):
 # --- ЗАКРЫТИЕ ЗАДАЧИ ---
 async def close_task(task_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE tasks SET status='closed' WHERE id=?", (task_id,))
+        await db.execute(
+            "UPDATE tasks SET status='closed', closed_at=? WHERE id=?",
+            (datetime.now().isoformat(), task_id)
+        )
+        await db.commit()
+
+
+async def reopen_task(task_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE tasks SET status='open', closed_at=NULL WHERE id=?",
+            (task_id,)
+        )
         await db.commit()
 
 
@@ -145,3 +158,105 @@ async def set_topic_enabled(chat_id, enabled: bool):
         else:
             await db.execute("INSERT INTO chats (chat_id, pin_message_id, mode, topic_enabled) VALUES (?, ?, ?, ?)", (chat_id, None, 'manual', val))
         await db.commit()
+
+
+async def upsert_chat_user(chat_id: int, user_id: int, username: Optional[str], full_name: Optional[str]):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO chat_users (chat_id, user_id, username, full_name, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                last_seen=excluded.last_seen
+            """,
+            (chat_id, user_id, username, full_name, datetime.now().isoformat())
+        )
+        await db.commit()
+
+
+async def get_chat_users(chat_id: int) -> List[Tuple[int, Optional[str], Optional[str]]]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT user_id, username, full_name FROM chat_users WHERE chat_id=? ORDER BY last_seen DESC",
+            (chat_id,)
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_all_chat_ids() -> List[int]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        chat_ids = set()
+        async with db.execute("SELECT DISTINCT chat_id FROM chat_users") as cursor:
+            for row in await cursor.fetchall():
+                chat_ids.add(row[0])
+        async with db.execute("SELECT DISTINCT chat_id FROM tasks") as cursor:
+            for row in await cursor.fetchall():
+                chat_ids.add(row[0])
+        async with db.execute("SELECT DISTINCT chat_id FROM chats") as cursor:
+            for row in await cursor.fetchall():
+                chat_ids.add(row[0])
+        return list(chat_ids)
+
+
+async def get_chat_info_text(chat_id: int) -> Optional[str]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT info_text FROM chats WHERE chat_id=?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def set_chat_info_text(chat_id: int, text: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT chat_id FROM chats WHERE chat_id=?", (chat_id,)) as cursor:
+            exists = await cursor.fetchone() is not None
+        if exists:
+            await db.execute("UPDATE chats SET info_text=? WHERE chat_id=?", (text, chat_id))
+        else:
+            await db.execute(
+                "INSERT INTO chats (chat_id, pin_message_id, mode, topic_enabled, info_text) VALUES (?, ?, ?, ?, ?)",
+                (chat_id, None, 'manual', 0, text)
+            )
+        await db.commit()
+
+
+async def get_chat_current_info_text(chat_id: int) -> Optional[str]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT current_info_text FROM chats WHERE chat_id=?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def set_chat_current_info_text(chat_id: int, text: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT chat_id FROM chats WHERE chat_id=?", (chat_id,)) as cursor:
+            exists = await cursor.fetchone() is not None
+        if exists:
+            await db.execute("UPDATE chats SET current_info_text=? WHERE chat_id=?", (text, chat_id))
+        else:
+            await db.execute(
+                "INSERT INTO chats (chat_id, pin_message_id, mode, topic_enabled, current_info_text) VALUES (?, ?, ?, ?, ?)",
+                (chat_id, None, 'manual', 0, text)
+            )
+        await db.commit()
+
+
+async def get_period_stats(chat_id: int, start_iso: str, end_iso: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE chat_id=? AND created_at>=? AND created_at<=?",
+            (chat_id, start_iso, end_iso)
+        ) as cursor:
+            created_cnt = (await cursor.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE chat_id=? AND closed_at IS NOT NULL AND closed_at>=? AND closed_at<=?",
+            (chat_id, start_iso, end_iso)
+        ) as cursor:
+            closed_cnt = (await cursor.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM tasks WHERE chat_id=? AND status='open'",
+            (chat_id,)
+        ) as cursor:
+            open_now = (await cursor.fetchone())[0]
+    return created_cnt, closed_cnt, open_now
