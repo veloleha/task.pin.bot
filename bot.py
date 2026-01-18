@@ -1223,6 +1223,57 @@ async def reopen_task_callback(callback: types.CallbackQuery):
             pass
 
 
+# --- ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ КНОПОК НА СООБЩЕНИЯХ ---
+async def restore_task_buttons():
+    """Восстанавливает корректные кнопки на всех сообщениях задач после перезапуска"""
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(DB_NAME) as db:
+            # Получаем все задачи с message_id
+            async with db.execute("SELECT id, chat_id, status, message_id FROM tasks WHERE message_id IS NOT NULL") as cursor:
+                tasks = await cursor.fetchall()
+        
+        if not tasks:
+            logger.info("ℹ️ Нет задач с сообщениями для восстановления кнопок")
+            return
+        
+        logger.info(f"🔄 Восстановление кнопок для {len(tasks)} задач...")
+        restored = 0
+        failed = 0
+        
+        for task_id, chat_id, status, message_id in tasks:
+            try:
+                # Определяем правильную кнопку в зависимости от статуса
+                if status == 'new':
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="📝 Создать задачу", callback_data=f"create_{task_id}")]]
+                    )
+                elif status == 'open':
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="✅ Закрыть задачу", callback_data=f"close_{task_id}")]]
+                    )
+                elif status == 'closed':
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="♻️ Переоткрыть", callback_data=f"reopen_{task_id}")]]
+                    )
+                else:
+                    continue
+                
+                # Обновляем кнопку на сообщении
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=kb)
+                restored += 1
+                
+            except Exception as e:
+                # Игнорируем ошибки (сообщение могло быть удалено)
+                failed += 1
+                logger.debug(f"⚠️ Не удалось восстановить кнопку для задачи #{task_id}: {e}")
+        
+        logger.info(f"✅ Восстановлено кнопок: {restored}, пропущено: {failed}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при восстановлении кнопок: {e}")
+
+
 # --- ИНИЦИАЛИЗАЦИЯ ЗАКРЕПОВ ДЛЯ ВСЕХ ЧАТОВ ---
 async def init_pins_for_all_chats():
     """Создает закрепленные сообщения для всех чатов с открытыми задачами"""
@@ -1242,6 +1293,8 @@ async def init_pins_for_all_chats():
                     await update_pinned_message(chat_id)
                 else:
                     logger.info(f"✅ Закреп уже существует для чата {chat_id} (message_id: {pin_id})")
+                    # Обновляем существующий закреп для актуализации данных
+                    await update_pinned_message(chat_id)
         else:
             logger.info("ℹ️ Нет чатов с открытыми задачами")
             
@@ -1265,8 +1318,11 @@ async def main():
         # Регистрируем команды, чтобы при вводе '/' клиенты показывали список
         await setup_bot_commands()
         
-        # Инициализируем закрепленные сообщения для всех чатов
+        # Восстанавливаем состояние после перезапуска
+        logger.info("🔄 Восстановление состояния бота...")
+        await restore_task_buttons()
         await init_pins_for_all_chats()
+        logger.info("✅ Состояние восстановлено, бот готов к работе!")
         
         await dp.start_polling(bot, skip_updates=True)
         
