@@ -55,6 +55,7 @@ REPLYMARKUP_RETRY_TASKS = {}
 REPLYMARKUP_RETRY_PAYLOAD = {}
 TASK_LOCKS = {}
 CHAT_LOCKS = {}
+USER_MESSAGE_LOCKS = {}  # Lock для последовательной обработки сообщений от одного пользователя
 
 
 def _throttled(store, key, min_interval: float) -> bool:
@@ -64,6 +65,16 @@ def _throttled(store, key, min_interval: float) -> bool:
         return True
     store[key] = now
     return False
+
+
+async def _throttle_wait(store, key, min_interval: float) -> None:
+    loop = asyncio.get_event_loop()
+    now = loop.time()
+    last = store.get(key, 0.0)
+    wait_s = min_interval - (now - last)
+    if wait_s > 0:
+        await asyncio.sleep(wait_s)
+    store[key] = loop.time()
 
 
 def _parse_retry_after_seconds(error_text: str) -> Optional[int]:
@@ -88,6 +99,13 @@ def get_chat_lock(chat_id):
     if chat_id not in CHAT_LOCKS:
         CHAT_LOCKS[chat_id] = asyncio.Lock()
     return CHAT_LOCKS[chat_id]
+
+
+def get_user_message_lock(user_id):
+    """Получить lock для пользователя (последовательная обработка сообщений)"""
+    if user_id not in USER_MESSAGE_LOCKS:
+        USER_MESSAGE_LOCKS[user_id] = asyncio.Lock()
+    return USER_MESSAGE_LOCKS[user_id]
 
 DB_NAME = "tasks.db"
 
@@ -872,106 +890,111 @@ async def handle_message(message: types.Message):
         return
 
     chat_id = message.chat.id
-    await track_user(chat_id, message.from_user)
-    # Throttle message spam per chat+user
-    if _throttled(LAST_MSG_TS, (chat_id, message.from_user.id), 0.8):
-        return
-    username = message.from_user.username or message.from_user.full_name or "Аноним"
-    text = message.text or message.caption or "(медиа без текста)"
-    # Формируем подпись автора: @username если есть, иначе имя без @
-    author_label = (
-        f"@{html.escape(message.from_user.username)}" if message.from_user.username else html.escape(message.from_user.full_name or "Аноним")
-    )
-    display_username = html.escape(username)
-    display_text = html.escape(text)
-
-    # Сохранить в базу (сначала без message_id)
-    task_id = await add_task(chat_id, message.from_user.id, username, text)
-    logger.info(f"📝 Создана задача #{task_id} от @{username} в чате {chat_id}")
-
-    # Определяем режим и формируем клавиатуру
-    mode = await get_chat_mode(chat_id)
-    is_auto = (mode == 'auto')
-    topics = await get_topic_enabled(chat_id)
-    if is_auto:
-        await set_task_status(task_id, 'open')
-        kb = build_task_kb(task_id, 'open')
-    else:
-        kb = build_task_kb(task_id, 'new')
-
-    source_message_id = None
-    try:
-        has_media = (
-            getattr(message, "photo", None)
-            or getattr(message, "video", None)
-            or getattr(message, "document", None)
-            or getattr(message, "animation", None)
-            or getattr(message, "voice", None)
-            or getattr(message, "audio", None)
-            or getattr(message, "sticker", None)
-            or getattr(message, "video_note", None)
+    user_id = message.from_user.id
+    
+    # Получаем lock для пользователя для последовательной обработки
+    user_lock = get_user_message_lock(user_id)
+    
+    async with user_lock:
+        await track_user(chat_id, message.from_user)
+        # Throttle message spam per chat+user
+        await _throttle_wait(LAST_MSG_TS, (chat_id, user_id), 0.8)
+        username = message.from_user.username or message.from_user.full_name or "Аноним"
+        text = message.text or message.caption or "(медиа без текста)"
+        # Формируем подпись автора: @username если есть, иначе имя без @
+        author_label = (
+            f"@{html.escape(message.from_user.username)}" if message.from_user.username else html.escape(message.from_user.full_name or "Аноним")
         )
-        if has_media:
-            sent_msg = None
-            # Отправляем медиа c явным caption, чтобы гарантировать подпись автора
-            if getattr(message, "photo", None):
-                file_id = message.photo[-1].file_id
-                sent_msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            elif getattr(message, "video", None):
-                file_id = message.video.file_id
-                sent_msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            elif getattr(message, "document", None):
-                file_id = message.document.file_id
-                sent_msg = await bot.send_document(chat_id=chat_id, document=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            elif getattr(message, "animation", None):
-                file_id = message.animation.file_id
-                sent_msg = await bot.send_animation(chat_id=chat_id, animation=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            elif getattr(message, "audio", None):
-                file_id = message.audio.file_id
-                sent_msg = await bot.send_audio(chat_id=chat_id, audio=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            elif getattr(message, "voice", None):
-                file_id = message.voice.file_id
-                sent_msg = await bot.send_voice(chat_id=chat_id, voice=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
-            else:
-                # Типы без caption (sticker/video_note) — отправим как есть + отдельным сообщением подпись
-                copied = await bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message.message_id, reply_markup=kb)
-                new_message_id = getattr(copied, "message_id", None)
-                if new_message_id:
-                    await update_task_message_id(task_id, new_message_id)
-                    source_message_id = new_message_id
-                # Дополнительная подпись отдельным сообщением
-                await bot.send_message(chat_id=chat_id, text=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML")
+        display_username = html.escape(username)
+        display_text = html.escape(text)
 
-            if sent_msg:
-                await update_task_message_id(task_id, sent_msg.message_id)
-                logger.debug(f"✉️ Отправлено медиа {sent_msg.message_id} с подписью автора для задачи #{task_id}")
-                source_message_id = sent_msg.message_id
+        # Сохранить в базу (сначала без message_id)
+        task_id = await add_task(chat_id, user_id, username, text)
+        logger.info(f"📝 Создана задача #{task_id} от @{username} в чате {chat_id}")
+
+        # Определяем режим и формируем клавиатуру
+        mode = await get_chat_mode(chat_id)
+        is_auto = (mode == 'auto')
+        topics = await get_topic_enabled(chat_id)
+        if is_auto:
+            await set_task_status(task_id, 'open')
+            kb = build_task_kb(task_id, 'open')
         else:
-            sent_msg = await bot.send_message(
-                chat_id=chat_id,
-                text=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}",
-                parse_mode="HTML",
-                reply_markup=kb
-            )
-            await update_task_message_id(task_id, sent_msg.message_id)
-            logger.debug(f"✉️ Отправлено сообщение {sent_msg.message_id} с кнопкой для задачи #{task_id}")
-            source_message_id = sent_msg.message_id
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки сообщения для задачи #{task_id}: {e}")
-    
-    # В авто-режиме сразу обновляем закреп
-    if is_auto:
-        try:
-            await schedule_update_pinned_message(chat_id)
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось обновить закреп в авто-режиме: {e}")
+            kb = build_task_kb(task_id, 'new')
 
-    # Если включены темы — создаём тему в авто-режиме сразу
-    if topics and is_auto and source_message_id:
-        await create_task_topic_and_post(chat_id, task_id, source_message_id)
-    
-    # Удалить оригинальное сообщение (требуются права администратора) — не блокируем обработчик
-    asyncio.create_task(delete_message_safe(chat_id, message.message_id))
+        source_message_id = None
+        try:
+            has_media = (
+                getattr(message, "photo", None)
+                or getattr(message, "video", None)
+                or getattr(message, "document", None)
+                or getattr(message, "animation", None)
+                or getattr(message, "voice", None)
+                or getattr(message, "audio", None)
+                or getattr(message, "sticker", None)
+                or getattr(message, "video_note", None)
+            )
+            if has_media:
+                sent_msg = None
+                # Отправляем медиа c явным caption, чтобы гарантировать подпись автора
+                if getattr(message, "photo", None):
+                    file_id = message.photo[-1].file_id
+                    sent_msg = await bot.send_photo(chat_id=chat_id, photo=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                elif getattr(message, "video", None):
+                    file_id = message.video.file_id
+                    sent_msg = await bot.send_video(chat_id=chat_id, video=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                elif getattr(message, "document", None):
+                    file_id = message.document.file_id
+                    sent_msg = await bot.send_document(chat_id=chat_id, document=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                elif getattr(message, "animation", None):
+                    file_id = message.animation.file_id
+                    sent_msg = await bot.send_animation(chat_id=chat_id, animation=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                elif getattr(message, "audio", None):
+                    file_id = message.audio.file_id
+                    sent_msg = await bot.send_audio(chat_id=chat_id, audio=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                elif getattr(message, "voice", None):
+                    file_id = message.voice.file_id
+                    sent_msg = await bot.send_voice(chat_id=chat_id, voice=file_id, caption=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML", reply_markup=kb)
+                else:
+                    # Типы без caption (sticker/video_note) — отправим как есть + отдельным сообщением подпись
+                    copied = await bot.copy_message(chat_id=chat_id, from_chat_id=chat_id, message_id=message.message_id, reply_markup=kb)
+                    new_message_id = getattr(copied, "message_id", None)
+                    if new_message_id:
+                        await update_task_message_id(task_id, new_message_id)
+                        source_message_id = new_message_id
+                    # Дополнительная подпись отдельным сообщением
+                    await bot.send_message(chat_id=chat_id, text=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}", parse_mode="HTML")
+
+                if sent_msg:
+                    await update_task_message_id(task_id, sent_msg.message_id)
+                    logger.debug(f"✉️ Отправлено медиа {sent_msg.message_id} с подписью автора для задачи #{task_id}")
+                    source_message_id = sent_msg.message_id
+            else:
+                sent_msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"👤 <b>Сообщение от</b> {author_label}:\n\n{display_text}",
+                    parse_mode="HTML",
+                    reply_markup=kb
+                )
+                await update_task_message_id(task_id, sent_msg.message_id)
+                logger.debug(f"✉️ Отправлено сообщение {sent_msg.message_id} с кнопкой для задачи #{task_id}")
+                source_message_id = sent_msg.message_id
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения для задачи #{task_id}: {e}")
+        
+        # В авто-режиме сразу обновляем закреп
+        if is_auto:
+            try:
+                await schedule_update_pinned_message(chat_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось обновить закреп в авто-режиме: {e}")
+
+        # Если включены темы — создаём тему в авто-режиме сразу
+        if topics and is_auto and source_message_id:
+            await create_task_topic_and_post(chat_id, task_id, source_message_id)
+        
+        # Удалить оригинальное сообщение (требуются права администратора) — не блокируем обработчик
+        asyncio.create_task(delete_message_safe(chat_id, message.message_id))
 
 
 # --- НАЖАТИЕ КНОПКИ "СОЗДАТЬ ЗАДАЧУ" ---
@@ -1324,7 +1347,7 @@ async def main():
         await init_pins_for_all_chats()
         logger.info("✅ Состояние восстановлено, бот готов к работе!")
         
-        await dp.start_polling(bot, skip_updates=True)
+        await dp.start_polling(bot, skip_updates=False)
         
     except Exception as e:
         logger.critical(f"❌ Критическая ошибка при запуске бота: {e}")
